@@ -1,0 +1,73 @@
+# Build the static export and publish it to GitHub Pages on every push to main.
+#
+# Two jobs rather than one, because they need different powers. "build" only reads
+# the repo and produces a folder. "deploy" holds the token that can publish to your
+# live site. Splitting them means the step that runs npm (and therefore runs code
+# from your dependencies) never holds the credential that can change what the world
+# sees. This is the structure GitHub's own starter workflow uses, for that reason.
+
+name: Deploy to GitHub Pages
+
+on:
+  push:
+    branches: [main]
+  # Lets you re-run it by hand from the Actions tab without pushing anything.
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  pages: write
+  id-token: write
+
+# If you push twice quickly, let the first deploy finish rather than cancelling it
+# halfway. A half-published site is worse than a slightly stale one.
+concurrency:
+  group: "pages"
+  cancel-in-progress: false
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out the repository
+        uses: actions/checkout@v4
+
+      - name: Set up Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+          cache-dependency-path: web/package-lock.json
+
+      # npm ci, not npm install. "ci" installs exactly what package-lock.json
+      # pins and fails if the lockfile disagrees with package.json, so the build
+      # here is the build you tested. "install" is free to resolve newer versions,
+      # which is how a deploy breaks on a day you changed nothing.
+      - name: Install dependencies
+        run: npm ci
+        working-directory: web
+
+      - name: Build the static export
+        run: npm run build
+        working-directory: web
+        env:
+          # The one place the subfolder is named. Must match the repo name.
+          NEXT_PUBLIC_BASE_PATH: /sawt
+
+      - name: Upload the built site
+        uses: actions/upload-pages-artifact@v3
+        with:
+          # Paths here are relative to the repo root, NOT to working-directory
+          # above: that setting applies only to `run` steps.
+          path: web/out
+
+  deploy:
+    needs: build
+    runs-on: ubuntu-latest
+    environment:
+      name: github-pages
+      url: ${{ steps.deployment.outputs.page_url }}
+    steps:
+      - name: Publish to GitHub Pages
+        id: deployment
+        uses: actions/deploy-pages@v5
