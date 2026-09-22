@@ -1,0 +1,20 @@
+# Replit reads this file to decide what to install and what "Run" does.
+#
+# The app is a Next.js static export living in web/. Running the dev server
+# rather than a build means changes show up on save, which is what you want
+# when you are poking at it.
+
+modules = ["nodejs-20", "python-3.11"]
+run = "npm --prefix web install && npm --prefix web run dev -- -H 0.0.0.0 -p 3000"
+
+[env]
+NEXT_TELEMETRY_DISABLED = "1"
+
+# Replit gives the repl a public *.replit.dev address and forwards port 80
+# there. Next listens on 3000, so the two are wired together here.
+[[ports]]
+localPort = 3000
+externalPort = 80
+
+[nix]
+channel = "stable-24_05"

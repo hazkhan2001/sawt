@@ -1,0 +1,6 @@
+# Install with:  pip install -r requirements.txt
+# ffmpeg is also needed for make_web_audio.py, but it is a program rather than
+# a Python package, so it is installed separately (apt, brew, or winget).
+
+requests          # every HTTP call in the harvesters
+pydantic          # build_site_data.py, the validation wall

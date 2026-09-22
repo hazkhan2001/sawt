@@ -1,0 +1,20 @@
+@import "tailwindcss";
+
+/* Design tokens, carried over from the Python prototype so the two look like one
+   project. Defined once here and referenced by name everywhere else. */
+@theme {
+  --color-surface: #05070a;
+  --color-panel: #0b1017;
+  --color-line: #26303d;
+  --color-ink: #f2f5f8;
+  --color-ink-2: #97a4b5;
+  --color-accent: #7fb2f0;
+  --color-call: #3987e5;
+  --color-devotional: #d95926;
+  --color-music: #199e70;
+  --color-recitation: #e8eaed;
+  --color-muted: #8b97a6;
+}
+
+html, body { height: 100%; background: var(--color-surface); color: var(--color-ink); }
+body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }

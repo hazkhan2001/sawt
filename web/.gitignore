@@ -1,0 +1,8 @@
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+
+# public/audio and public/data ARE committed. They are the shipped data
+# contract and the 101 streaming copies the page plays, and the site cannot
+# build without them: lib/data.ts imports the JSON at build time.

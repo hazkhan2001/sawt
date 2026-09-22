@@ -1,0 +1,53 @@
+# ---------------------------------------------------------------------------
+# Secrets. Never commit these. config.py reads them from the environment or
+# from a local .env, which is exactly so that they can stay out of the repo.
+# ---------------------------------------------------------------------------
+.env
+.env.*
+!.env.example
+.freesound_oauth.json
+
+# ---------------------------------------------------------------------------
+# Python leftovers
+# ---------------------------------------------------------------------------
+__pycache__/
+*.pyc
+venv/
+.venv/
+
+# ---------------------------------------------------------------------------
+# Audio that is too large or too regenerable to belong in git.
+#
+# sawt_audio/     masters, up to 258MB per file. Keep them, never ship them.
+# sawt_web/       the transcode staging area. web/public/audio is the shipped copy.
+# sawt_local_audio/ own field recordings, not yet gathered.
+# ---------------------------------------------------------------------------
+sawt_audio/
+sawt_web/
+sawt_local_audio/
+
+# ---------------------------------------------------------------------------
+# Generated output. Every one of these is rebuilt by a script in this repo,
+# so committing them would mean two copies that can disagree.
+# ---------------------------------------------------------------------------
+sawt_globe.html
+sawt_map.html
+cleanup_manifest.txt
+sawt_candidates_preview.json
+*.bak
+*.bak-*
+
+# ---------------------------------------------------------------------------
+# The Claude desktop app writes copies of files it hands you into this folder.
+# They are duplicates of things already in the repo, so they do not belong here.
+# ---------------------------------------------------------------------------
+Claude outputs/
+
+# ---------------------------------------------------------------------------
+# Node / Next.js
+# ---------------------------------------------------------------------------
+node_modules/
+.next/
+out/
+*.tsbuildinfo
+.DS_Store

@@ -1,0 +1,24 @@
+# ---------------------------------------------------------------------------
+# Line endings.
+#
+# Windows ends a line with CR+LF, macOS and Linux with LF alone. Without a rule
+# here, a file committed from Windows carries its CRLF into the repo, and the
+# first friend who opens it on a Mac sees every line of every file marked as
+# changed. Their editor then "fixes" it back, and the two of you trade the same
+# 159,000-line diff forever.
+#
+# "text=auto eol=lf" says: work out which files are text, store LF in the repo,
+# and check out whatever the local machine prefers. Nobody has to think about it
+# again, which is the point.
+# ---------------------------------------------------------------------------
+* text=auto eol=lf
+
+# ---------------------------------------------------------------------------
+# Binary files. Git already guesses these correctly, but the guess is a
+# heuristic and the rule above is not. Saying it outright means no future
+# pattern can ever line-ending-mangle a recording.
+# ---------------------------------------------------------------------------
+*.opus binary
+*.jpg  binary
+*.jpeg binary
+*.png  binary
