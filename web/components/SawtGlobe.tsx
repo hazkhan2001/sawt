@@ -4,112 +4,139 @@
 // runs there. It has to, because a globe is WebGL and WebGL needs a real canvas,
 // a GPU and a window. Everything else in this app is a server component that runs
 // once at build time and arrives as finished HTML.
-
-import { useMemo, useRef, useState } from "react";
-import dynamic from "next/dynamic";
-import type { SoundHub, SoundTrack, Genre } from "@/lib/types";
-import { FAMILY_COLOUR, HOLLOW, PLACE_BASIS_LABEL } from "@/lib/types";
-import { formatDuration, yearLabel } from "@/lib/data";
-
-// Where this site lives on its host. Empty locally and on a root domain; "/sawt"
-// on GitHub Pages, which serves project sites from a subfolder. Next rewrites its
-// OWN links and assets from next.config's basePath, but it cannot rewrite a string
-// we build ourselves, and the <audio src> below is exactly that. Without this the
-// page would load perfectly on Pages and every recording would 404, which is the
-// worst kind of bug: silent, and only in production.
 //
-// NEXT_PUBLIC_ is not decoration. Next only exposes variables with that prefix to
-// browser code, and it inlines the value at BUILD time, so this is a literal string
-// in the shipped bundle rather than a lookup that would find nothing in a browser.
+// This file is the conductor. It owns the STATE (which place is open, what is
+// playing, which layers are on) and hands pieces of it to the components that draw:
+// Legend, HubPanel, Player, and the globe itself. The rules those components follow
+// live in lib/: markers.ts (how a place looks), prayer.ts (the live layer),
+// playback.ts (what plays next), search.ts.
+
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import dynamic from "next/dynamic";
+import * as THREE from "three";
+import type { Family, Genre, PlaceBasis, SoundHub, SoundTrack } from "@/lib/types";
+import { FAMILY, GLYPH, PLACE_BASIS_ORDER } from "@/lib/types";
+import { buildMarker, type HubView } from "@/lib/markers";
+import { formatIn, hubPrayerStatus, prayerLines, sunVector, type PrayerLine } from "@/lib/prayer";
+import { makeDayNightMaterial, setSun } from "@/lib/dayNight";
+import { pickDriftStop, transition } from "@/lib/playback";
+import { buildIndex, type SearchHit } from "@/lib/search";
+import Legend, { type SkinName } from "./Legend";
+import HubPanel from "./HubPanel";
+import Player from "./Player";
+
+// Where this site lives on its host: "" locally, "/sawt" on GitHub Pages. Next
+// rewrites its OWN links from basePath, but not strings we build ourselves, like
+// texture and audio URLs. See claude/deployment.md: this is the load-bearing detail.
 const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+const tex = (name: string) => `${BASE_PATH}/textures/${name}`;
 
 // react-globe.gl reaches for `window` the moment it is imported, and during a build
-// there is no window. ssr:false loads it only in the browser. Without this the build
-// dies with "window is not defined".
+// there is no window. ssr:false loads it only in the browser.
 const Globe = dynamic(() => import("react-globe.gl"), { ssr: false });
 
-// Real NASA imagery, three ways. Muted is the default because the markers read most
-// clearly against it; daylight is the familiar Blue Marble; night is the Black Marble
-// city-lights composite.
-type SkinName = "muted" | "daylight" | "night";
+// Textures now ship with the site (public/textures) instead of loading from
+// unpkg.com, so a network that blocks unpkg no longer shows a black sphere.
 const SKINS: Record<SkinName, string> = {
-  muted: "https://unpkg.com/three-globe/example/img/earth-dark.jpg",
-  daylight: "https://unpkg.com/three-globe/example/img/earth-blue-marble.jpg",
-  night: "https://unpkg.com/three-globe/example/img/earth-night.jpg",
+  muted: tex("earth-dark.jpg"),
+  daylight: tex("earth-blue-marble.jpg"),
+  night: tex("earth-night.jpg"),
 };
 
-// The same three hues as the Python prototype, as plain hex because these get written
-// into an SVG string where a CSS variable would not resolve.
-const HEX_COLOUR: Record<Genre, string> = {
-  adhan: "#3987e5",
-  dhikr_hadra: "#d95926",
-  inshad_madih: "#d95926",
-  qawwali: "#d95926",
-  art_music: "#199e70",
-  nawbah: "#199e70",
-  tilawa: "#e8eaed",
-  ambience: "#8b97a6",
-  other: "#8b97a6",
+const PANEL_PX = 384;        // side card width (22rem) plus its margins
+const PLAYER_PX = 104;       // player bar height; the sheet and legend make room
+
+// Line widths are in angular degrees of the globe. Maghrib is drawn 1.25° wide on
+// purpose: the earth turns 1.25° in five minutes, about the length of one adhan, so
+// the band's width IS the stretch of land where the call is sounding right now.
+const LINE_STYLE: Record<string, { colour: string; width: number; dash?: [number, number] }> = {
+  Fajr: { colour: "#f5c26b", width: 0.35, dash: [0.02, 0.012] },
+  Dhuhr: { colour: "rgba(242,245,248,.75)", width: 0.3 },
+  Asr: { colour: "#f5c26b", width: 0.35 },
+  Maghrib: { colour: "rgba(127,178,240,.85)", width: 1.25 },
+  Isha: { colour: "#7fb2f0", width: 0.35, dash: [0.02, 0.012] },
 };
 
-const GENRE_LABEL: Partial<Record<Genre, string>> = {
-  adhan: "Adhan and call to prayer",
-  dhikr_hadra: "Sufi dhikr and hadra",
-  inshad_madih: "Nasheed, ilahi and madih",
-  qawwali: "Qawwali",
-  art_music: "Maqam, mugham and modal",
-  nawbah: "Andalusi nawbah",
-  tilawa: "Quran recitation",
-  ambience: "Mosque and street ambience",
-  other: "Other",
-};
+/** Parse "#istanbul/fr-12345" into its two parts. */
+function readHash(): { hubId: string | null; trackId: string | null } {
+  const raw = decodeURIComponent(window.location.hash.replace(/^#/, ""));
+  const [hubId, trackId] = raw.split("/");
+  return { hubId: hubId || null, trackId: trackId || null };
+}
 
-export default function SawtGlobe({
-  hubs, tracks,
-}: { hubs: SoundHub[]; tracks: SoundTrack[] }) {
-  const [openHub, setOpenHub] = useState<SoundHub | null>(null);
-  const [playing, setPlaying] = useState<SoundTrack | null>(null);
+export default function SawtGlobe({ hubs, tracks }: { hubs: SoundHub[]; tracks: SoundTrack[] }) {
+  // ---------------- state ----------------
+  const [openHubId, setOpenHubId] = useState<string | null>(null);
+  const [playingId, setPlayingId] = useState<string | null>(null);
   const [hidden, setHidden] = useState<Set<Genre>>(new Set());
   const [skin, setSkin] = useState<SkinName>("muted");
-  // The legend starts collapsed. On a phone it opens with a tap; from the sm
-  // breakpoint up CSS keeps it open regardless, so this state does nothing there.
-  const [legendOpen, setLegendOpen] = useState(false);
-  // The hub essay starts collapsed. It runs to roughly two hundred words, and on a
-  // phone the panel is capped at 75% of the viewport, so leaving it open by default
-  // would push every recording off the bottom of the screen before you saw one.
-  const [historyOpen, setHistoryOpen] = useState(false);
+  const [aboutOpen, setAboutOpen] = useState(false);
+  const [live, setLive] = useState(false);
+  const [drifting, setDrifting] = useState(false);
+  const [now, setNow] = useState(() => new Date());
+  const [pendingMs, setPendingMs] = useState<number | null>(null);
+  const [wide, setWide] = useState(false);
+  const [ready, setReady] = useState(false);      // the globe has drawn its first frame
+
   const globeRef = useRef<any>(null);
+  const defaultMaterial = useRef<THREE.MeshPhongMaterial | null>(null);
+  const dayNight = useRef<ReturnType<typeof makeDayNightMaterial> | null>(null);
+  const pendingTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const viewShift = useRef(0);
 
+  // ---------------- derived data ----------------
   // useMemo caches a computed value and recomputes only when its inputs change.
-  const visibleTracks = useMemo(
-    () => tracks.filter((t) => !hidden.has(t.genre)),
-    [tracks, hidden],
-  );
+  const hubById = useMemo(() => new Map(hubs.map((h) => [h.id, h])), [hubs]);
+  const trackById = useMemo(() => new Map(tracks.map((t) => [t.id, t])), [tracks]);
+  const visibleTracks = useMemo(() => tracks.filter((t) => !hidden.has(t.genre)), [tracks, hidden]);
 
-  const visibleHubs = useMemo(() => {
-    // Each hub needs two things the raw data does not carry: how many of its tracks
-    // are visible right now, and what colour to draw. A place holding four adhan and
-    // one mugham takes the adhan colour. The number on the circle and the list inside
-    // carry the detail, so colour is only a hint at what is mostly there.
-    const counts = new Map<string, number>();
-    const palettes = new Map<string, Map<string, number>>();
-    visibleTracks.forEach((t) => {
-      counts.set(t.hubId, (counts.get(t.hubId) ?? 0) + 1);
-      const tally = palettes.get(t.hubId) ?? new Map<string, number>();
-      const colour = HEX_COLOUR[t.genre];
-      tally.set(colour, (tally.get(colour) ?? 0) + 1);
-      palettes.set(t.hubId, tally);
+  // Group once: Map<hubId, tracks[]>. Everything that needs "the tracks at a place"
+  // reads this instead of filtering the whole list again.
+  const visibleByHub = useMemo(() => {
+    const groups = new Map<string, SoundTrack[]>();
+    visibleTracks.forEach((t) => groups.set(t.hubId, [...(groups.get(t.hubId) ?? []), t]));
+    return groups;
+  }, [visibleTracks]);
+
+  const openHub = openHubId ? hubById.get(openHubId) ?? null : null;
+  const playing = playingId ? trackById.get(playingId) ?? null : null;
+  const openTracks = openHub ? visibleByHub.get(openHub.id) ?? [] : [];
+
+  // The list the player steps through: the playing track's own place, so prev and
+  // next always stay within one soundscape even if another place is open.
+  const queue = playing ? visibleByHub.get(playing.hubId) ?? [playing] : [];
+  const queuePos = playing ? queue.findIndex((t) => t.id === playing.id) : -1;
+
+  const hubViews: HubView[] = useMemo(() => {
+    return hubs.flatMap((h) => {
+      const list = visibleByHub.get(h.id) ?? [];
+      if (!list.length && !h.isAnchor) return [];      // a filtered-out place disappears
+      const fam = new Map<Family, number>();
+      const basisMix: Partial<Record<PlaceBasis, number>> = {};
+      const glyphs = new Set(list.map((t) => GLYPH[t.genre]));
+      list.forEach((t) => {
+        fam.set(FAMILY[t.genre], (fam.get(FAMILY[t.genre]) ?? 0) + 1);
+        basisMix[t.placeBasis] = (basisMix[t.placeBasis] ?? 0) + 1;
+      });
+      // The STRONGEST evidence present decides the marker's outline. A place with
+      // even one geotagged recording is a place we know sound came from; the list
+      // rows then show which of its recordings are less certain.
+      const best = PLACE_BASIS_ORDER.find((b) => basisMix[b]) ?? null;
+      const status = live && list.length ? hubPrayerStatus(h.lat, h.lng, now) : null;
+      return [{
+        ...h,
+        visibleCount: list.length,
+        families: [...fam.entries()].sort((a, b) => b[1] - a[1]),
+        glyph: glyphs.size === 1 ? [...glyphs][0] : null,
+        basisMix, best,
+        selected: h.id === openHubId,
+        callingNow: status?.callingNow ?? null,
+        nextPrayer: status?.next ? `${status.next.prayer} in ${formatIn(status.next.minutes)}` : null,
+      }];
     });
-    return hubs
-      .map((h) => {
-        const tally = palettes.get(h.id);
-        const colour = tally
-          ? [...tally.entries()].sort((a, b) => b[1] - a[1])[0][0]
-          : "#8b97a6";
-        return { ...h, visibleCount: counts.get(h.id) ?? 0, colour };
-      })
-      .filter((h) => h.visibleCount > 0 || h.isAnchor);
-  }, [hubs, visibleTracks]);
+  }, [hubs, visibleByHub, openHubId, live, now]);
+
+  const lines: PrayerLine[] = useMemo(() => (live ? prayerLines(now) : []), [live, now]);
 
   const genreCounts = useMemo(() => {
     const counts = new Map<Genre, number>();
@@ -117,17 +144,118 @@ export default function SawtGlobe({
     return [...counts.entries()].sort((a, b) => b[1] - a[1]);
   }, [tracks]);
 
-  const openTracks = openHub
-    ? visibleTracks.filter((t) => t.hubId === openHub.id)
-    : [];
+  const index = useMemo(() => buildIndex(hubs, tracks), [hubs, tracks]);
 
-  function openPlace(hub: SoundHub) {
-    setOpenHub(hub);
-    setPlaying(null);
-    setHistoryOpen(false);   // a new place starts closed, whatever the last one was
-    globeRef.current?.pointOfView(
-      { lat: hub.lat, lng: hub.lng, altitude: 1.4 }, 850,
-    );
+  const liveSummary = useMemo(() => {
+    if (!live) return null;
+    const calling = hubViews.filter((h) => h.callingNow);
+    if (!calling.length) return "No mapped place is mid-adhan this minute.";
+    return `Being called now: ${calling.map((h) => `${h.callingNow} in ${h.name}`).join(", ")}.`;
+  }, [live, hubViews]);
+
+  // ---------------- camera ----------------
+  // Keep the open place centred in the space LEFT of the side card, not behind it.
+  // camera.setViewOffset shifts the rendered picture sideways without shrinking the
+  // canvas, so the starfield still fills the screen. The HTML markers use the same
+  // camera matrices, so they shift with it and stay on their cities.
+  const shiftView = useCallback((target: number) => {
+    const camera = globeRef.current?.camera?.();
+    if (!camera) return;
+    const start = viewShift.current;
+    const t0 = performance.now();
+    const step = (t: number) => {
+      const k = Math.min(1, (t - t0) / 600);
+      const eased = 1 - Math.pow(1 - k, 3);                    // ease-out cubic
+      const x = start + (target - start) * eased;
+      viewShift.current = x;
+      const w = window.innerWidth, h = window.innerHeight;
+      if (Math.abs(x) < 0.5) camera.clearViewOffset();
+      else camera.setViewOffset(w, h, x, 0, w, h);
+      camera.updateProjectionMatrix();
+      if (k < 1) requestAnimationFrame(step);
+    };
+    requestAnimationFrame(step);
+  }, []);
+
+  useEffect(() => {
+    const onResize = () => {
+      setWide(window.innerWidth >= 640);
+      // setViewOffset remembers the window size it was given, so a resize has to
+      // restate it or the picture drifts off-centre.
+      const camera = globeRef.current?.camera?.();
+      if (camera && Math.abs(viewShift.current) >= 0.5) {
+        const w = window.innerWidth, h = window.innerHeight;
+        camera.setViewOffset(w, h, viewShift.current, 0, w, h);
+        camera.updateProjectionMatrix();
+      }
+    };
+    onResize();
+    window.addEventListener("resize", onResize);
+    return () => window.removeEventListener("resize", onResize);
+  }, []);
+
+  useEffect(() => {
+    if (ready) shiftView(openHub && wide ? PANEL_PX / 2 : 0);
+  }, [openHub, wide, ready, shiftView]);
+
+  // ---------------- actions ----------------
+  const clearPending = () => {
+    if (pendingTimer.current) clearTimeout(pendingTimer.current);
+    pendingTimer.current = null;
+    setPendingMs(null);
+  };
+
+  const openPlace = useCallback((hub: SoundHub, opts: { fromDrift?: boolean } = {}) => {
+    if (!opts.fromDrift) setDrifting(false);       // a manual choice ends Drift
+    setOpenHubId(hub.id);
+    // An empty anchor has nothing to list, so its essay IS the content: open it.
+    setAboutOpen(!(visibleByHub.get(hub.id)?.length) && !!hub.historicalContext);
+    globeRef.current?.pointOfView({ lat: hub.lat, lng: hub.lng, altitude: 1.5 }, 900);
+  }, [visibleByHub]);
+
+  function play(track: SoundTrack) {
+    clearPending();
+    setDrifting(false);
+    setPlayingId(track.id);
+  }
+
+  // Move to `next` after the silence the transition rule asks for.
+  function playAfterSilence(next: SoundTrack, from: SoundTrack | null, then?: () => void) {
+    clearPending();
+    const { silenceMs } = transition(from, next);
+    setPendingMs(silenceMs);
+    pendingTimer.current = setTimeout(() => {
+      setPendingMs(null);
+      setPlayingId(next.id);
+      then?.();
+    }, silenceMs);
+  }
+
+  function driftHop() {
+    const stop = pickDriftStop(hubs, visibleByHub, playing?.hubId ?? openHubId);
+    if (!stop) return;
+    playAfterSilence(stop.track, playing, () => openPlace(stop.hub, { fromDrift: true }));
+  }
+
+  function onEnded() {
+    if (drifting) return driftHop();
+    const next = queue[queuePos + 1];
+    if (next) playAfterSilence(next, playing);     // autoplay within the same place
+  }
+
+  function startDrift() {
+    if (drifting) { setDrifting(false); return; }
+    setDrifting(true);
+    const stop = pickDriftStop(hubs, visibleByHub, playing?.hubId ?? null);
+    if (!stop) return;
+    clearPending();
+    setPlayingId(stop.track.id);          // a click just happened, so audio may start
+    openPlace(stop.hub, { fromDrift: true });
+  }
+
+  function onPick(hit: SearchHit) {
+    openPlace(hit.hub);
+    if (hit.track) play(hit.track);
   }
 
   function toggleGenre(genre: Genre) {
@@ -135,288 +263,192 @@ export default function SawtGlobe({
       // React state must never be mutated in place: make a new Set, or React cannot
       // tell anything changed and will not re-render.
       const next = new Set(current);
-      if (next.has(genre)) next.delete(genre);
-      else next.add(genre);
+      if (next.has(genre)) next.delete(genre); else next.add(genre);
       return next;
     });
   }
 
+  // ---------------- deep links: #hub/track ----------------
+  // The URL is the one piece of state that can leave this browser. Reading it on
+  // load and writing it on every change means any view can be shared by copying
+  // the address bar.
+  const applyHash = useCallback(() => {
+    const { hubId, trackId } = readHash();
+    const hub = hubId ? hubById.get(hubId) : undefined;
+    if (!hub) return;
+    openPlace(hub);
+    if (trackId && trackById.get(trackId)?.hubId === hub.id) setPlayingId(trackId);
+  }, [hubById, trackById, openPlace]);
+
+  // Read the link once on arrival. This only sets STATE, so it does not need the
+  // globe to exist yet; the camera catches up in the effect below once it does.
+  // (The empty dependency list [] means "run once, after the first render".)
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  useEffect(() => { applyHash(); }, []);
+
+  useEffect(() => {
+    if (!ready || !openHub) return;
+    globeRef.current?.pointOfView({ lat: openHub.lat, lng: openHub.lng, altitude: 1.5 }, 900);
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [ready]);
+
+  useEffect(() => {
+    window.addEventListener("hashchange", applyHash);
+    return () => window.removeEventListener("hashchange", applyHash);
+  }, [applyHash]);
+
+  useEffect(() => {
+    // replaceState, not location.hash = ...: changing the hash directly would add a
+    // history entry per click (Back would step through every track) and fire our
+    // own hashchange listener.
+    // The open place wins; the track joins it only if it belongs there. So the
+    // address always describes what is on screen, and a link opens the same view.
+    const hubPart = openHubId ?? playing?.hubId ?? null;
+    const trackPart = playing && playing.hubId === hubPart ? playing.id : null;
+    const hash = hubPart ? `#${hubPart}${trackPart ? "/" + trackPart : ""}` : "";
+    const url = window.location.pathname + window.location.search + hash;
+    if (url !== window.location.pathname + window.location.search + window.location.hash) {
+      window.history.replaceState(null, "", url);
+    }
+  }, [openHubId, playing]);
+
+  // ---------------- live layer ----------------
+  useEffect(() => {
+    if (!live) return;
+    setNow(new Date());
+    // The lines move about 0.125° every 30 seconds: fast enough to see, slow enough
+    // that redrawing more often would only burn battery.
+    const timer = setInterval(() => setNow(new Date()), 30_000);
+    return () => clearInterval(timer);
+  }, [live]);
+
+  // The globe's surface material. globeMaterial is a PROP of react-globe.gl, not a
+  // method on its ref, so the choice is made in render: the sunlit shader while the
+  // live layer is on, otherwise a plain Phong material (what globe.gl uses by
+  // default) which receives the chosen basemap texture. Both are created once and
+  // kept in refs, because building a material every render would leak GPU memory.
+  const surface = useMemo(() => {
+    if (typeof window === "undefined") return undefined;
+    if (!defaultMaterial.current) defaultMaterial.current = new THREE.MeshPhongMaterial({ color: 0xffffff });
+    if (!live) return defaultMaterial.current;
+    dayNight.current ??= makeDayNightMaterial(tex("earth-blue-marble.jpg"), tex("earth-night.jpg"));
+    return dayNight.current;
+  }, [live]);
+
+  useEffect(() => {
+    if (live && dayNight.current) setSun(dayNight.current, sunVector(now));
+  }, [live, now]);
+
+  // Stop any pending transition if the component goes away.
+  useEffect(() => () => clearPending(), []);
+
+  // ---------------- render ----------------
   return (
-    <main className="relative h-dvh w-full overflow-hidden">
-      {/* The globe lives in its own layer at z-0. Everything else stacks above it.
-          Without an explicit layer the markers and the panels share one stacking
-          context and their order depends on document order, which is fragile. */}
+    <main className="relative h-dvh w-full overflow-hidden"
+          style={{ ["--player-h" as string]: playing ? `${PLAYER_PX}px` : "0px" }}>
       <div className="absolute inset-0 z-0">
-      <Globe
-        ref={globeRef}
-        globeImageUrl={SKINS[skin]}
-        bumpImageUrl="https://unpkg.com/three-globe/example/img/earth-topology.png"
-        backgroundImageUrl="https://unpkg.com/three-globe/example/img/night-sky.png"
-        atmosphereColor="#79a9e0"
-        atmosphereAltitude={0.15}
-        htmlElementsData={visibleHubs}
-        htmlLat={(d: any) => d.lat}
-        htmlLng={(d: any) => d.lng}
-        htmlAltitude={0.01}
-        htmlElement={(d: any) => {
-          const size = Math.round(16 + 9 * Math.sqrt(Math.max(d.visibleCount - 1, 0)));
-          const wrap = document.createElement("div");
-          wrap.style.cursor = "pointer";
-          // The globe's HTML layer sets pointer-events: none on its container, so that
-          // dragging the globe still works through the markers. Each marker has to opt
-          // back in. This one line is why nothing responded to a click.
-          wrap.style.pointerEvents = "auto";
-          wrap.innerHTML =
-            '<svg width="' + size + '" height="' + size +
-            '" viewBox="0 0 ' + size + ' ' + size + '">' +
-            '<circle cx="' + size / 2 + '" cy="' + size / 2 +
-            '" r="' + (size / 2 - 2.5) + '" fill="' +
-            (d.visibleCount ? d.colour : "none") + '" stroke="' +
-            (d.visibleCount ? "rgba(2,4,8,.9)" : "#8b97a6") + '" stroke-width="' +
-            (d.visibleCount ? 1.5 : 2) + '" stroke-dasharray="' +
-            (d.visibleCount ? "" : "3 3") + '" />' +
-            (d.visibleCount > 1
-              ? '<text x="' + size / 2 + '" y="' + size / 2 +
-                '" text-anchor="middle" dominant-baseline="central" font-size="11"' +
-                ' font-weight="600" fill="#05070a">' + d.visibleCount + "</text>"
-              : "") +
-            "</svg>";
-          wrap.title = d.name + " (" + d.visibleCount + ")";
-          wrap.onclick = (event) => { event.stopPropagation(); openPlace(d); };
-          return wrap;
-        }}
-        htmlElementVisibilityModifier={(el: HTMLElement, isVisible: boolean) => {
-          // Hide markers on the far side of the sphere so the back does not show
-          // through the front.
-          el.style.opacity = isVisible ? "1" : "0";
-          el.style.pointerEvents = isVisible ? "auto" : "none";
-        }}
-      />
+        <Globe
+          ref={globeRef}
+          onGlobeReady={() => {
+            setReady(true);
+          }}
+          globeMaterial={surface}
+          globeImageUrl={SKINS[skin]}
+          bumpImageUrl={tex("earth-topology.png")}
+          backgroundImageUrl={tex("night-sky.png")}
+          atmosphereColor="#79a9e0"
+          atmosphereAltitude={0.15}
+          htmlElementsData={hubViews}
+          htmlLat={(d: any) => d.lat}
+          htmlLng={(d: any) => d.lng}
+          htmlAltitude={0.01}
+          htmlElement={(d: any) => buildMarker(d as HubView, (hub) => openPlace(hub))}
+          htmlElementVisibilityModifier={(el: HTMLElement, isVisible: boolean) => {
+            // Hide markers on the far side of the sphere.
+            el.style.opacity = isVisible ? "1" : "0";
+            el.style.pointerEvents = isVisible ? "auto" : "none";
+          }}
+          pathsData={lines}
+          pathPoints={(d: any) => d.points}
+          pathPointLat={(p: any) => p[0]}
+          pathPointLng={(p: any) => p[1]}
+          pathPointAlt={0.004}
+          pathColor={(d: any) => LINE_STYLE[d.prayer].colour}
+          pathStroke={(d: any) => LINE_STYLE[d.prayer].width}
+          pathDashLength={(d: any) => LINE_STYLE[d.prayer].dash?.[0] ?? 1}
+          pathDashGap={(d: any) => LINE_STYLE[d.prayer].dash?.[1] ?? 0}
+          pathLabel={(d: any) => `${d.prayer} is being called along this line`}
+          pathTransitionDuration={0}
+        />
       </div>
 
-      {/* A scrim: darkens the globe behind an open panel, and closes it on a tap.
-          On a phone the panel covers most of the screen, so the globe behind it is
-          noise. On a wide screen the panel is a side card and the scrim would be
-          heavy-handed, so it only appears below the sm breakpoint. */}
+      {/* A scrim on phones: darkens the globe behind the sheet and closes it on tap. */}
       {openHub && (
-        <button
-          aria-label="Close panel"
-          onClick={() => { setOpenHub(null); setPlaying(null); setHistoryOpen(false); }}
-          className="fixed inset-0 z-30 bg-black/55 sm:hidden"
+        <button aria-label="Close panel" onClick={() => setOpenHubId(null)}
+                className="fixed inset-0 z-30 bg-black/55 sm:hidden" />
+      )}
+
+      <Legend
+        trackCount={visibleTracks.length}
+        placeCount={hubViews.filter((h) => h.visibleCount > 0).length}
+        undatedCount={visibleTracks.filter((t) => t.dateBasis === "unknown").length}
+        genreCounts={genreCounts}
+        hidden={hidden}
+        onToggleGenre={toggleGenre}
+        skin={skin}
+        onSkin={setSkin}
+        live={live}
+        onLive={() => setLive((v) => !v)}
+        liveSummary={liveSummary}
+        drifting={drifting}
+        onDrift={startDrift}
+        index={index}
+        onPick={onPick}
+      />
+
+      {openHub && (
+        <HubPanel
+          hub={openHub}
+          tracks={openTracks}
+          playingId={playingId}
+          aboutOpen={aboutOpen}
+          prayerNote={(() => {
+            const v = hubViews.find((h) => h.id === openHub.id);
+            if (!v) return null;
+            return v.callingNow ? `${v.callingNow} is being called here now`
+                 : v.nextPrayer ? `Next here: ${v.nextPrayer}` : null;
+          })()}
+          onToggleAbout={() => setAboutOpen((o) => !o)}
+          onPlay={play}
+          onClose={() => setOpenHubId(null)}
         />
       )}
 
-      {/* Legend, filters and basemap */}
-      <section className="absolute left-3 top-3 z-20 max-w-[calc(100vw-1.5rem)]
-                          rounded-xl border border-[var(--color-line)]
-                          bg-[var(--color-panel)] px-3 py-2 shadow-2xl
-                          sm:left-4 sm:top-4 sm:w-64 sm:px-4 sm:py-4">
-        {/* The header is a button on a phone and plain text on a wider screen. One
-            element doing both jobs, rather than two that can drift apart. */}
-        <button
-          onClick={() => setLegendOpen((open) => !open)}
-          className="flex w-full items-center gap-2 text-left sm:pointer-events-none"
-          aria-expanded={legendOpen}
-        >
-          <span className="text-base font-semibold tracking-wide sm:text-lg">Sawt</span>
-          <span className="flex-1 text-[11px] text-[var(--color-ink-2)] sm:hidden">
-            {visibleTracks.length} recordings
-          </span>
-          <span className={"text-[var(--color-ink-2)] transition-transform sm:hidden " +
-                           (legendOpen ? "rotate-180" : "")}>
-            &#9662;
-          </span>
-        </button>
-
-        <div className={(legendOpen ? "block" : "hidden") + " sm:block"}>
-        <p className="mb-2 mt-1 text-xs text-[var(--color-ink-2)] sm:mb-3">
-          {visibleTracks.length} recordings in{" "}
-          {visibleHubs.filter((h) => h.visibleCount > 0).length} places
+      {playing ? (
+        <Player
+          track={playing}
+          hub={hubById.get(playing.hubId)}
+          hasPrev={queuePos > 0}
+          hasNext={drifting || queuePos < queue.length - 1}
+          drifting={drifting}
+          pendingMs={pendingMs}
+          onPrev={() => { clearPending(); setPlayingId(queue[queuePos - 1].id); }}
+          onNext={() => {
+            if (drifting) return driftHop();
+            clearPending();
+            setPlayingId(queue[queuePos + 1].id);
+          }}
+          onEnded={onEnded}
+          onStop={() => { clearPending(); setDrifting(false); setPlayingId(null); }}
+          onStopDrift={() => setDrifting(false)}
+          onShowPlace={() => { const h = hubById.get(playing.hubId); if (h) openPlace(h, { fromDrift: drifting }); }}
+        />
+      ) : (
+        <p className="absolute bottom-4 left-4 z-20 hidden rounded-lg border border-[var(--color-line)]
+                      bg-[var(--color-panel)] px-3 py-2 text-xs text-[var(--color-ink-2)] sm:block">
+          Drag to spin &middot; hover a place to see what is there &middot; click to open it
         </p>
-
-        {genreCounts.map(([genre, count]) => (
-          <button
-            key={genre}
-            onClick={() => toggleGenre(genre)}
-            className={"flex w-full items-center gap-2 py-1 text-left text-[13px]" +
-                       " transition-opacity hover:text-white" +
-                       (hidden.has(genre) ? " opacity-30" : "")}
-          >
-            <svg width="13" height="13" viewBox="0 0 14 14" className="shrink-0">
-              <circle cx="7" cy="7" r="5"
-                fill={HOLLOW.includes(genre) ? "none" : FAMILY_COLOUR[genre]}
-                stroke={FAMILY_COLOUR[genre]}
-                strokeWidth={HOLLOW.includes(genre) ? 2.5 : 1.5} />
-            </svg>
-            <span className="flex-1">{GENRE_LABEL[genre] ?? genre}</span>
-            <span className="text-xs tabular-nums text-[var(--color-ink-2)]">{count}</span>
-          </button>
-        ))}
-
-        <div className="mt-3 flex gap-1 border-t border-[var(--color-line)] pt-3">
-          {(["muted", "daylight", "night"] as SkinName[]).map((name) => (
-            <button
-              key={name}
-              onClick={() => setSkin(name)}
-              className={"flex-1 rounded-md border border-[var(--color-line)] py-1" +
-                         " text-[11px] capitalize transition-colors " +
-                         (skin === name
-                           ? "border-[#35475e] bg-[#17212e] text-white"
-                           : "text-[var(--color-ink-2)] hover:text-white")}
-            >
-              {name}
-            </button>
-          ))}
-        </div>
-        </div>
-      </section>
-
-      {/* Hub panel */}
-      {openHub && (
-        // On a phone this is a bottom sheet: full width, anchored to the bottom edge,
-        // capped at 75% of the viewport so the globe stays visible above it. From the
-        // sm breakpoint up it becomes the floating side card again.
-        //
-        // The background is now fully OPAQUE. It was 95% with a backdrop blur, which
-        // let the bright markers behind it glow through and smear. Translucency is a
-        // nice effect over a photograph and a bad one over forty small bright dots.
-        <aside className="fixed inset-x-0 bottom-0 z-40 flex max-h-[75dvh] flex-col
-                          overflow-hidden rounded-t-2xl border border-[var(--color-line)]
-                          bg-[var(--color-panel)] shadow-2xl
-                          sm:absolute sm:inset-x-auto sm:bottom-auto sm:right-4 sm:top-4
-                          sm:max-h-[calc(100dvh-2rem)] sm:w-[22rem] sm:rounded-xl">
-          <div className="mx-auto mt-2 h-1 w-10 shrink-0 rounded-full
-                          bg-[var(--color-line)] sm:hidden" />
-          <header className="relative border-b border-[var(--color-line)] px-5 py-4">
-            <button
-              onClick={() => { setOpenHub(null); setPlaying(null); setHistoryOpen(false); }}
-              className="absolute right-4 top-3 text-xl leading-none text-[var(--color-ink-2)]"
-              aria-label="Close"
-            >
-              &times;
-            </button>
-            <p className="text-xs uppercase tracking-[0.09em] text-[var(--color-accent)]">
-              {openHub.country}
-            </p>
-            <h2 className="text-base font-semibold">{openHub.name}</h2>
-            <p className="mt-1 text-xs text-[var(--color-ink-2)]">
-              {openTracks.length} {openTracks.length === 1 ? "recording" : "recordings"}
-              {openHub.isAnchor ? " · anchor hub" : ""}
-            </p>
-            {openHub.description ? (
-              <p className="mt-2 pr-4 text-[13px] leading-relaxed text-[var(--color-ink-2)]">
-                {openHub.description}
-              </p>
-            ) : null}
-          </header>
-
-          {/* One scroll container for the essay AND the track list. Putting the essay
-              in the fixed header instead made the header taller than the sheet on a
-              phone, which left no room at all for the recordings it was introducing. */}
-          <div className="flex-1 overflow-y-auto">
-            {openHub.historicalContext ? (
-              <div className="border-b border-[var(--color-line)]">
-                <button
-                  onClick={() => setHistoryOpen((open) => !open)}
-                  aria-expanded={historyOpen}
-                  className="flex w-full items-center gap-2 px-5 py-2.5 text-left
-                             text-[11px] uppercase tracking-[0.09em]
-                             text-[var(--color-ink-2)] hover:text-[var(--color-ink)]"
-                >
-                  <span className="flex-1">History</span>
-                  <span className={"transition-transform " + (historyOpen ? "rotate-180" : "")}>
-                    &#9662;
-                  </span>
-                </button>
-                {historyOpen && (
-                  <div className="space-y-2.5 px-5 pb-4 text-[13px] leading-relaxed
-                                  text-[var(--color-ink-2)]">
-                    {/* The essay stores paragraph breaks as blank lines. JSX collapses
-                        a newline inside a text node to a space, so the split has to
-                        happen here or the whole thing arrives as one grey slab. */}
-                    {openHub.historicalContext.split("\n\n").map((para, i) => (
-                      <p key={i}>{para}</p>
-                    ))}
-                  </div>
-                )}
-              </div>
-            ) : openHub.isAnchor ? (
-              <p className="border-b border-[var(--color-line)] px-5 py-3 text-xs
-                            italic text-[var(--color-ink-2)]">
-                The written history for this place is still to come.
-              </p>
-            ) : null}
-
-          <ul>
-            {openTracks.length === 0 && (
-              <li className="px-5 py-6 text-[13px] text-[var(--color-ink-2)]">
-                Nothing here yet. The open archives hold almost nothing from this place,
-                which is itself worth knowing.
-              </li>
-            )}
-            {openTracks.map((track) => (
-              <li key={track.id}>
-                <button
-                  onClick={() => setPlaying(track)}
-                  className={"flex w-full items-start gap-3 border-b" +
-                             " border-[var(--color-line)]/50 px-5 py-3 text-left" +
-                             " hover:bg-[var(--color-accent)]/10" +
-                             (playing?.id === track.id ? " bg-[var(--color-accent)]/15" : "")}
-                >
-                  <svg width="12" height="12" viewBox="0 0 12 12" className="mt-1.5 shrink-0">
-                    <circle cx="6" cy="6" r="4"
-                      fill={HOLLOW.includes(track.genre) ? "none" : FAMILY_COLOUR[track.genre]}
-                      stroke={FAMILY_COLOUR[track.genre]}
-                      strokeWidth={HOLLOW.includes(track.genre) ? 2.5 : 1.5} />
-                  </svg>
-                  <span>
-                    <span className="block text-[13px] leading-snug">{track.title}</span>
-                    <span className="mt-0.5 block text-[11px] text-[var(--color-ink-2)]">
-                      {[GENRE_LABEL[track.genre], yearLabel(track),
-                        formatDuration(track.durationSeconds)]
-                        .filter(Boolean).join(" · ")}
-                    </span>
-                  </span>
-                </button>
-              </li>
-            ))}
-          </ul>
-          </div>
-
-          {playing && (
-            <footer className="border-t border-[var(--color-line)] px-5 py-4">
-              {/* A plain <audio> element. Phase 3 replaces this with Howler for
-                  crossfades; for now the browser's own player is the right amount of
-                  machinery, and it is accessible and keyboard-operable for free. */}
-              <audio key={playing.id} src={`${BASE_PATH}/${playing.audioUrl}`} controls autoPlay
-                     className="w-full" />
-              <p className="mt-2 text-[11px] leading-relaxed text-[var(--color-ink-2)]">
-                {[playing.license,
-                  playing.attribution ? "by " + playing.attribution : null]
-                  .filter(Boolean).join(" · ")}
-              </p>
-              {playing.contextNotes && (
-                <p className="mt-1 text-[11px] text-[var(--color-ink-2)]">
-                  {playing.contextNotes}
-                </p>
-              )}
-              <p className="mt-2 text-[11px] text-[var(--color-ink-2)]">
-                {PLACE_BASIS_LABEL[playing.placeBasis]}
-              </p>
-              <a href={playing.sourceUrl} target="_blank" rel="noopener noreferrer"
-                 className="mt-1 inline-block text-[11px] text-[var(--color-accent)]">
-                Source page
-              </a>
-            </footer>
-          )}
-        </aside>
       )}
-
-      <p className="absolute bottom-4 left-4 z-20 hidden rounded-lg border sm:block
-                    border-[var(--color-line)] bg-[var(--color-panel)] px-3 py-2
-                    text-xs text-[var(--color-ink-2)] backdrop-blur">
-        Drag to spin &middot; click a place to open it
-      </p>
     </main>
   );
 }

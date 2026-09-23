@@ -10,18 +10,17 @@ import tracksJson from "@/public/data/tracks.json";
 export const hubs = hubsJson as SoundHub[];
 export const tracks = tracksJson as SoundTrack[];
 
-export const tracksByHub = (hubId: string) =>
-  tracks.filter((t) => t.hubId === hubId);
-
-export function formatDuration(seconds: number | null): string {
-  if (!seconds) return "";
+export function formatDuration(seconds: number | null | undefined): string {
+  if (!seconds || !isFinite(seconds)) return "";
   const mins = Math.floor(seconds / 60);
-  const secs = Math.round(seconds % 60);
+  const secs = Math.floor(seconds % 60);
   return `${mins}:${secs.toString().padStart(2, "0")}`;
 }
 
-export function yearLabel(track: SoundTrack): string {
+// "undated" is written out on purpose. A blank where the year should be looks like
+// a layout gap; the word says it is a gap in what we know. 66 of 101 tracks say it.
+export function dateLabel(track: SoundTrack): string {
   if (track.yearRange) return `${track.yearRange[0]}–${track.yearRange[1]}`;
   if (track.recordedYear) return String(track.recordedYear);
-  return "";
+  return "undated";
 }

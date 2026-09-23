@@ -148,6 +148,86 @@ def known_date(title: str):
     return None, ""
 
 
+# ---------------------------------------------------------------------------
+# Display titles
+#
+# The raw `title` is EVIDENCE: it is exactly what the uploader typed, and it is how
+# you would find the recording again on its source page. So it is never edited.
+# `displayTitle` is DERIVED from it, for people to read. Two fields, because one
+# field cannot be both a faithful record and a tidy label.
+# ---------------------------------------------------------------------------
+
+# Only these count as file extensions. A general "anything after the last dot" rule
+# (which is what pathlib's Path(...).stem does) breaks on real titles in this set:
+#   "Istanbul - Istambul, mosqué bleue. Appel à la prière 10 mai 2007"
+#       -> Path().stem cuts at ". Appel", treating half the title as an extension
+#   "Dhuhr adhan, Hamtramck, Michigan (96k/24-bit)"
+#       -> the "/" makes Path() think it is a folder, and .stem returns "24-bit)"
+# A title is not a path, so it should not be parsed as one. The explicit list below
+# says exactly what we mean. (?i) makes the match case-insensitive, for ".WAV".
+AUDIO_EXTENSION = re.compile(r"(?i)\.(wav|ogg|oga|opus|mp3|flac|aiff?|m4a|webm)$")
+
+
+def make_display_title(raw: str, source: str = "") -> str:
+    """
+    'Istanbul-Sazendeleri-5.wav'    -> 'Istanbul Sazendeleri 5'
+    'Husseyni Saz Semayissi .ogg'   -> 'Husseyni Saz Semayissi'
+    '... Uthman al-Mosuli.ogg'      -> '... Uthman al-Mosuli'   (hyphen kept!)
+    'Walled City, Lahore, Pakistan - Badshahi Mosque Call for Prayer'
+                                    -> 'Badshahi Mosque Call for Prayer'
+    """
+    # 1. Strip BEFORE removing the extension: in "Semayissi .ogg" the stray space sits
+    #    in front of the dot, so it only becomes removable trailing space afterwards.
+    text = AUDIO_EXTENSION.sub("", raw.strip()).strip()
+
+    # 2. Hyphens and underscores mean "space" only in filename-style titles, the ones
+    #    with no real spaces at all ("turkish-music-6"). In a title that already has
+    #    spaces, a hyphen is deliberate: "al-Mosuli", "Manend-Muxalif".
+    #    [-_]+ is a character class: one or more hyphens or underscores in a row.
+    if " " not in text:
+        text = re.sub(r"[-_]+", " ", text)
+
+    # 3. radio aporee (via archive.org) titles are "reverse-geocoded address - title".
+    #    The panel already names the place, so keep only the part the recordist wrote.
+    #    rpartition splits on the LAST " - " and returns (before, separator, after).
+    if source == "archive.org":
+        before, sep, after = text.rpartition(" - ")
+        if sep and "," in before and after.strip():
+            text = after
+        # aporee recordists often lead with the clock time, "1231 Muezzin prayers".
+        # ^ anchors to the start; \d{3,4} is three or four digits; \s+ the space after;
+        # (?=\D) is a LOOKAHEAD: "only if a non-digit comes next", checked but not
+        # removed, so a title that is nothing but a number is left alone.
+        text = re.sub(r"^\d{3,4}\s+(?=\D)", "", text)
+
+    # 4. Collapse doubled spaces, and lift a lowercase first letter ("turkish" ->
+    #    "Turkish"). Only the first character: .capitalize() would also LOWER the rest.
+    text = re.sub(r"\s{2,}", " ", text).strip()
+    if text[:1].islower():
+        text = text[0].upper() + text[1:]
+    return text or raw.strip()
+
+
+# Review notes are written for you, in the middle of a listening session. Some are
+# real captions ("Khutba in Shali Egypt"); some are verdicts that only mean anything
+# beside the approve button ("YES", "Very rare!"). The stray "YES" on the live site
+# was exactly that: a review note, shipped as if it were a description.
+#
+# A set, because the question is "is it one of these?", and a set answers that in one
+# step however long it gets. Compared after lowercasing and trimming punctuation.
+VERDICT_NOTES = {"yes", "no", "ok", "okay", "good", "great", "keep", "approve",
+                 "approved", "very rare", "rare", "nice", "interesting"}
+
+
+def caption_from_note(note: str) -> str:
+    """Return the review note if it reads as a public caption, else ''."""
+    cleaned = (note or "").strip()
+    bare = re.sub(r"[^\w\s]", "", cleaned).strip().lower()
+    if not bare or bare in VERDICT_NOTES or len(bare.split()) < 3:
+        return ""
+    return cleaned
+
+
 def slug(text: str) -> str:
     """A url-safe, stable id. Stable matters: it is a foreign key, not a label."""
     text = unicodedata.normalize("NFKD", text.lower())
@@ -188,7 +268,8 @@ class SoundHub(BaseModel):
 class SoundTrack(BaseModel):
     id: str
     hubId: str
-    title: str = Field(min_length=1)
+    title: str = Field(min_length=1)          # raw, exactly as the source has it
+    displayTitle: str = Field(min_length=1)   # derived from title, for reading
     performerOrZawiya: str = ""
     genre: Literal["art_music", "qawwali", "dhikr_hadra", "inshad_madih", "nawbah",
                    "adhan", "tilawa", "ambience", "other"]
@@ -310,7 +391,7 @@ def build() -> tuple[list, list, list]:
             continue
 
         audio = c.get("web_audio") or c.get("local_audio") or c.get("audio_url") or ""
-        note = (reviews.get(source_ref) or {}).get("note", "")
+        note = caption_from_note((reviews.get(source_ref) or {}).get("note", ""))
 
         # A finding from reading the archive page beats anything inferred from the
         # scraped licence string. A finding with basis None is a deliberate refusal,
@@ -343,6 +424,7 @@ def build() -> tuple[list, list, list]:
                 id=f"{c['source'][:2]}-{slug(source_ref.rstrip('/').split('/')[-1] or c['title'])}",
                 hubId=hub_id,
                 title=c["title"],
+                displayTitle=make_display_title(c["title"], c.get("source", "")),
                 performerOrZawiya=performer,
                 genre=GENRE_MAP[genre_key],
                 subGenre=label,

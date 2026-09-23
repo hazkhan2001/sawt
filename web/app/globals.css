@@ -16,5 +16,83 @@
   --color-muted: #8b97a6;
 }
 
+/* Amiri for Arabic script only.
+   unicode-range tells the browser "use this face ONLY for these characters". So
+   "Sawt Arabic" can sit FIRST in the font stack: Arabic letters come from Amiri,
+   and everything else falls straight through to the system sans. One stack, no
+   need to wrap Arabic runs in special spans. The files are bundled from
+   @fontsource/amiri at build time, so there is no request to Google at runtime,
+   and the relative url() is rewritten by Next to include the /sawt base path. */
+@font-face {
+  font-family: "Sawt Arabic";
+  font-style: normal;
+  font-weight: 400;
+  font-display: swap;
+  src: url("../node_modules/@fontsource/amiri/files/amiri-arabic-400-normal.woff2") format("woff2");
+  unicode-range: U+0600-06FF, U+0750-077F, U+0870-08FF, U+FB50-FDFF, U+FE70-FEFF;
+}
+@font-face {
+  font-family: "Sawt Arabic";
+  font-style: normal;
+  font-weight: 700;
+  font-display: swap;
+  src: url("../node_modules/@fontsource/amiri/files/amiri-arabic-700-normal.woff2") format("woff2");
+  unicode-range: U+0600-06FF, U+0750-077F, U+0870-08FF, U+FB50-FDFF, U+FE70-FEFF;
+}
+
 html, body { height: 100%; background: var(--color-surface); color: var(--color-ink); }
-body { font-family: ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif; }
+body {
+  font-family: "Sawt Arabic", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+}
+
+/* ---------------- globe markers (built in lib/markers.ts) ---------------- */
+
+.hub { position: relative; cursor: pointer; display: grid; place-items: center; }
+.hub > svg { display: block; overflow: visible; }
+
+/* three.js sets an inline z-index on each marker by depth; a hovered marker must
+   beat that so its tooltip is never hidden behind a neighbour. !important is the
+   one tool that outranks an inline style from a stylesheet. */
+.hub:hover { z-index: 100000 !important; }
+
+.hub-label {
+  position: absolute; top: calc(100% - 6px); left: 50%; transform: translateX(-50%);
+  font-size: 10.5px; letter-spacing: .05em; white-space: nowrap; pointer-events: none;
+  color: var(--color-ink);
+  text-shadow: 0 0 3px #000, 0 1px 3px #000, 0 0 1px #000;
+}
+
+.hub-tip {
+  display: none; position: absolute; bottom: calc(100% - 2px); left: 50%;
+  transform: translateX(-50%); white-space: nowrap; pointer-events: none;
+  background: var(--color-panel); border: 1px solid var(--color-line); border-radius: 8px;
+  padding: 6px 9px; font-size: 11px; line-height: 1.55; color: var(--color-ink-2);
+  box-shadow: 0 6px 20px rgba(0,0,0,.5);
+}
+.hub-tip b { color: var(--color-ink); font-weight: 600; }
+.hub:hover .hub-tip { display: block; }
+
+/* The open place pulses. A ring grows and fades; ::before is a pseudo-element, an
+   extra box CSS draws without any extra HTML. --ring is set per marker. */
+.hub.selected::before, .hub.calling::after {
+  content: ""; position: absolute; inset: 0; margin: auto;
+  width: var(--ring); height: var(--ring); border-radius: 50%; pointer-events: none;
+}
+.hub.selected::before { border: 2px solid var(--color-ink); animation: sawt-pulse 1.8s ease-out infinite; }
+.hub.calling::after { border: 2px solid var(--color-accent); animation: sawt-pulse 2.6s ease-out infinite; }
+@keyframes sawt-pulse {
+  from { transform: scale(1); opacity: .9; }
+  to   { transform: scale(2.3); opacity: 0; }
+}
+/* People who ask their system for less motion get a steady ring instead. */
+@media (prefers-reduced-motion: reduce) {
+  .hub.selected::before, .hub.calling::after { animation: none; transform: scale(1.35); opacity: .8; }
+}
+
+/* ---------------- player seek bar ---------------- */
+.sawt-range { -webkit-appearance: none; appearance: none; height: 4px; border-radius: 2px;
+  background: var(--color-line); accent-color: var(--color-accent); cursor: pointer; }
+.sawt-range::-webkit-slider-thumb { -webkit-appearance: none; width: 11px; height: 11px;
+  border-radius: 50%; background: var(--color-ink); }
+.sawt-range::-moz-range-thumb { width: 11px; height: 11px; border: 0; border-radius: 50%;
+  background: var(--color-ink); }
