@@ -11,6 +11,18 @@ import type { SoundHub, SoundTrack, Genre } from "@/lib/types";
 import { FAMILY_COLOUR, HOLLOW, PLACE_BASIS_LABEL } from "@/lib/types";
 import { formatDuration, yearLabel } from "@/lib/data";
 
+// Where this site lives on its host. Empty locally and on a root domain; "/sawt"
+// on GitHub Pages, which serves project sites from a subfolder. Next rewrites its
+// OWN links and assets from next.config's basePath, but it cannot rewrite a string
+// we build ourselves, and the <audio src> below is exactly that. Without this the
+// page would load perfectly on Pages and every recording would 404, which is the
+// worst kind of bug: silent, and only in production.
+//
+// NEXT_PUBLIC_ is not decoration. Next only exposes variables with that prefix to
+// browser code, and it inlines the value at BUILD time, so this is a literal string
+// in the shipped bundle rather than a lookup that would find nothing in a browser.
+const BASE_PATH = process.env.NEXT_PUBLIC_BASE_PATH ?? "";
+
 // react-globe.gl reaches for `window` the moment it is imported, and during a build
 // there is no window. ssr:false loads it only in the browser. Without this the build
 // dies with "window is not defined".
@@ -376,7 +388,7 @@ export default function SawtGlobe({
               {/* A plain <audio> element. Phase 3 replaces this with Howler for
                   crossfades; for now the browser's own player is the right amount of
                   machinery, and it is accessible and keyboard-operable for free. */}
-              <audio key={playing.id} src={"/" + playing.audioUrl} controls autoPlay
+              <audio key={playing.id} src={`${BASE_PATH}/${playing.audioUrl}`} controls autoPlay
                      className="w-full" />
               <p className="mt-2 text-[11px] leading-relaxed text-[var(--color-ink-2)]">
                 {[playing.license,
